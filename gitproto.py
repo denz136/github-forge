@@ -153,8 +153,6 @@ def v2_ls_refs(repo, request_packets):
                         line += f' peeled:{row[7:]}'
                         break
         out += pkt_line(line + '\n')
-    if not head_oid and unborn and matches(head_target) and not prefixes:
-        out += pkt_line(f'unborn {head_target} symref-target:{head_target}\n')
     out += b'0000'
     return bytes(out)
 
@@ -180,7 +178,23 @@ def _objects_for_tips(repo, tips, have_closure, shallow_boundary):
     objects = []
     seen_commits = set()
     for tip in tips:
-        stack = [tip]
+        # an annotated tag is its own object: deliver it, then peel to its target
+        entry = repo.store.get(tip)
+        if entry and entry[0] == 'tag':
+            if tip not in seen_oids:
+                seen_oids.add(tip)
+                objects.append({'type': 'tag', 'data': entry[1]})
+                text = entry[1].decode('utf-8', 'surrogateescape')
+                for row in text.split('\n'):
+                    if row.startswith('object '):
+                        stack = [row[7:]]
+                        break
+                else:
+                    stack = []
+            else:
+                stack = []
+        else:
+            stack = [tip]
         commit_order = []
         walked = set()
         while stack:
@@ -282,7 +296,27 @@ def v2_fetch(repo, request_packets):
     for have in haves:
         if repo.store.get(have):
             common.append(have)
-            have_closure |= repo.store.reachable([have])
+            if client_shallow:
+                # a shallow client only holds the boundary commit and its tree/blob closure
+                entry = repo.store.get(have)
+                have_closure.add(have)
+                if entry and entry[0] == 'commit':
+                    tree_oid = parse_commit(entry[1])['tree']
+                    stack = [tree_oid]
+                    while stack:
+                        t = stack.pop()
+                        if t in have_closure:
+                            continue
+                        have_closure.add(t)
+                        tentry = repo.store.get(t)
+                        if tentry and tentry[0] == 'tree':
+                            for mode, _n, child in parse_tree(tentry[1]):
+                                if mode == '40000':
+                                    stack.append(child)
+                                else:
+                                    have_closure.add(child)
+            else:
+                have_closure |= repo.store.reachable([have])
     if haves and not done:
         # stateless v2: answer with acknowledgments first; client resends with done
         out = bytearray(pkt_line('acknowledgments\n'))
@@ -308,71 +342,42 @@ def v2_fetch(repo, request_packets):
     if depth is not None:
         tips = [w for w in wants if repo.store.get(w)]
         if client_shallow:
-            # deepen relative to the client's boundaries
-            # collect the client's shallow tips plus their `depth-1` ancestors? The
-            # suite's deepen-2 fetch wants exactly one more generation.
-            # Walk each client boundary: the boundary itself counts as generation 1;
-            # deliver commits up to `depth` generations beyond it.
+            # deepen: deliver `depth` generations from each want, excluding what the
+            # client already holds (its shallow closure: boundary commits and ancestors)
             new_boundary = set()
+            deliver = []
+            seen = set()
+            held = set(client_shallow)
             for boundary in client_shallow:
-                generations = _ancestors(repo, boundary, depth)
-                # first generation is the boundary commit itself
-                for oid in generations[1:]:
-                    if oid in have_closure:
-                        continue
-                wanted_from_here = []
-                seen = set()
-                current = [boundary]
+                entry = repo.store.get(boundary)
+                if entry and entry[0] == 'commit':
+                    held |= set(_ancestors(repo, boundary, 100000))
+            for want in tips:
+                current = [want]
                 for gen in range(depth):
                     next_gen = []
                     for oid in current:
                         entry = repo.store.get(oid)
                         if not entry or entry[0] != 'commit':
                             continue
+                        if oid not in seen:
+                            seen.add(oid)
+                            deliver.append(oid)
                         fields = parse_commit(entry[1])
                         parents = fields.get('parents', [])
-                        if gen == depth - 1:
-                            new_boundary.update(p for p in parents if repo.store.get(p))
+                        if gen == depth - 1 and oid not in client_shallow:
+                            new_boundary.add(oid)
                         next_gen.extend(parents)
                     current = next_gen
-            # deliver objects for the commits between boundary and new boundary
-            deliver = set()
-            for boundary in client_shallow:
-                generations = _ancestors(repo, boundary, depth + 1)
-                for oid in generations[1:]:  # skip the boundary itself (client has it)
-                    if oid in have_closure:
-                        continue
-                    deliver.add(oid)
+            deliver = [oid for oid in deliver if oid not in client_shallow]
             shallow_boundary = new_boundary
-            tips = list(deliver - have_closure)
-            objects = _objects_for_tips(repo, tips, have_closure, shallow_boundary)
-            # for a deepen fetch the client already holds the want; deliver only new commits
-            if not objects:
-                objects = []
-                for oid in sorted(deliver):
-                    if oid in have_closure:
-                        continue
-                    entry = repo.store.get(oid)
-                    if entry and entry[0] == 'commit':
-                        objects.append({'type': 'commit', 'data': entry[1]})
-                        tree_oid = parse_commit(entry[1])['tree']
-                        tentry = repo.store.get(tree_oid)
-                        if tentry:
-                            objects.append({'type': 'tree', 'data': tentry[1]})
-            # shallow-info: new boundary commits, and unshallow for boundaries no longer shallow
-            for oid in sorted(new_boundary):
-                if oid not in have_closure and repo.store.get(oid):
-                    new_shallow.append(oid)
-            for oid in client_shallow:
-                if oid not in new_boundary:
-                    unshallow.append(oid)
-            # deepened trees/blobs of new commits
-            full_objects = []
+            objects = []
             tree_seen = set()
-            for obj in objects:
-                full_objects.append(obj)
-                if obj['type'] == 'commit':
-                    tree_oid = parse_commit(obj['data'])['tree']
+            for oid in deliver:
+                entry = repo.store.get(oid)
+                if entry and entry[0] == 'commit':
+                    objects.append({'type': 'commit', 'data': entry[1]})
+                    tree_oid = parse_commit(entry[1])['tree']
                     stack = [tree_oid]
                     while stack:
                         t = stack.pop()
@@ -380,17 +385,25 @@ def v2_fetch(repo, request_packets):
                             continue
                         tree_seen.add(t)
                         tentry = repo.store.get(t)
-                        if not tentry:
-                            continue
-                        full_objects.append({'type': 'tree', 'data': tentry[1]})
-                        for mode, _name, child in parse_tree(tentry[1]):
-                            if mode == '40000':
-                                stack.append(child)
-                            elif child not in have_closure:
-                                bentry = repo.store.get(child)
-                                if bentry:
-                                    full_objects.append({'type': 'blob', 'data': bentry[1]})
-            objects = full_objects
+                        if tentry:
+                            objects.append({'type': 'tree', 'data': tentry[1]})
+                            for mode, _name, child in parse_tree(tentry[1]):
+                                if mode == '40000':
+                                    stack.append(child)
+                                elif child not in have_closure:
+                                    bentry = repo.store.get(child)
+                                    if bentry:
+                                        objects.append({'type': 'blob', 'data': bentry[1]})
+            # shallow-info: the new boundary commits, and unshallow for boundaries no longer shallow
+            for oid in sorted(new_boundary):
+                if repo.store.get(oid):
+                    new_shallow.append(oid)
+            for oid in client_shallow:
+                if oid not in new_boundary:
+                    unshallow.append(oid)
+            if not new_boundary and client_shallow:
+                # history exhausted: the client's boundaries become the full-history roots
+                unshallow = list(client_shallow)
         else:
             # fresh shallow clone: depth generations from each want
             boundary = set()
@@ -573,24 +586,19 @@ def handle_receive_pack(repo, body):
     def is_ancestor(ancestor, descendant):
         if ancestor == descendant:
             return True
-        entry = repo.store.get(descendant)
-        while entry and entry[0] == 'commit':
-            fields = parse_commit(entry[1])
-            parents = fields.get('parents', [])
-            if ancestor in parents:
+        # walk all commits breadth-first looking for the ancestor
+        queue = [descendant]
+        seen = set()
+        while queue:
+            current = queue.pop(0)
+            if current == ancestor:
                 return True
-            if not parents:
-                return False
-            # walk all parents breadth-first
-            queue = list(parents)
-            while queue:
-                current = queue.pop(0)
-                if current == ancestor:
-                    return True
-                centry = repo.store.get(current)
-                if centry and centry[0] == 'commit':
-                    queue.extend(parse_commit(centry[1]).get('parents', []))
-            return False
+            if current in seen:
+                continue
+            seen.add(current)
+            entry = repo.store.get(current)
+            if entry and entry[0] == 'commit':
+                queue.extend(parse_commit(entry[1]).get('parents', []))
         return False
 
     for old, new, ref in commands:
@@ -611,6 +619,9 @@ def handle_receive_pack(repo, body):
                 continue
         elif current != old:
             lines.append(f'ng {ref} fetch first')
+            continue
+        elif current != ZERO_OID and not is_ancestor(current, new):
+            lines.append(f'ng {ref} non-fast-forward')
             continue
         if new not in repo.store.objects:
             lines.append(f'ng {ref} missing necessary objects')

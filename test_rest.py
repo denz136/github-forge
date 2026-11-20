@@ -69,6 +69,12 @@ def main():
         assert st == 404
         ok.append('DELETE contents + subsequent 404')
 
+        # labels: a label must exist before an issue may carry it
+        st, lbl, _ = jreq(port, 'POST', f'{O}/repos/adaiversen/rest/labels',
+                          body={'name': 'P1', 'color': 'ff0000'})
+        assert st == 201 and lbl['name'] == 'P1'
+        ok.append('create label')
+
         # issues
         st, issue, _ = jreq(port, 'POST', f'{O}/repos/adaiversen/rest/issues',
                             body={'title': 'bug one', 'body': 'b', 'labels': ['P1']})

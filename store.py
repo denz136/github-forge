@@ -82,6 +82,17 @@ class Repository:
         self.next_comment_id = 1
         self.lock = threading.RLock()
 
+    def seed_default_branch(self):
+        """Create refs/heads/<default> at the empty tree so a fresh repo is not unborn."""
+        if 'refs/heads/' + self.default_branch in self.refs:
+            return
+        tree_oid = self.tree_from_files([])
+        import time as _time
+        ident = f'{self.owner} <{self.owner}@example.invalid>'
+        data = build_commit(tree_oid, [], 'Initial commit', ident, int(_time.time()))
+        oid = self.store.put('commit', data)
+        self.refs['refs/heads/' + self.default_branch] = oid
+
     # -- commit helpers -------------------------------------------------
     def tree_from_files(self, files):
         """files: list of (path, bytes). Builds nested trees; returns root oid."""

@@ -237,11 +237,12 @@ class Forge:
                     items = [repo_json(r) for r in repos[start:start + per_page]]
                     extra = {}
                     if start + per_page < len(repos):
-                        base = query_path = '/api/v3/user/repos'
+                        host = headers.get('host') or headers.get('Host') or '127.0.0.1'
+                        base = f'http://{host}/api/v3/user/repos'
                         next_query = dict((k, v[0]) for k, v in query.items())
                         next_query['page'] = str(page + 1)
                         next_query['per_page'] = str(per_page)
-                        extra['Link'] = f'</{base}?{urllib.parse.urlencode(next_query)}>; rel="next"'
+                        extra['Link'] = f'<{base}?{urllib.parse.urlencode(next_query)}>; rel="next"'
                     return (200, items, extra)
                 if method == 'POST':
                     name = body_json.get('name') or ''
@@ -528,7 +529,7 @@ class Forge:
         labels = body_json.get('labels') or []
         for label in labels:
             if label not in repo.labels:
-                repo.labels[label] = 'ededed'  # GitHub auto-creates unknown labels on issue create
+                raise HttpError(422, f'Validation Failed: label "{label}" does not exist')
         number = repo.next_issue
         repo.next_issue += 1
         issue = {
@@ -602,6 +603,7 @@ class Forge:
             'merged': False,
             'merged_at': None,
             'merge_commit_sha': None,
+            'base_tip_at_open': repo.refs.get('refs/heads/' + base),
         }
         repo.pulls[number] = pull
         return pull
@@ -641,30 +643,21 @@ class Forge:
         head_tree = gitobj.parse_commit(repo.store.get(head_oid)[1])['tree']
         base_tree = gitobj.parse_commit(repo.store.get(base_oid)[1])['tree']
         changes = repo.diff_files(base_tree, head_tree)
-        for path, _status, _old, _new in changes:
-            # conflict check: the same path changed on base since the pull opened
-            base_files = dict(repo.all_files_at(base_tree))
-            if path in base_files:
-                entry = repo.store.get(base_files[path])
-                pull_base = getattr(pull, '_base_tree_at_open', None)
-        # detect conflicts: another merged pull changed the same path after this pull opened
         merge_method = body_json.get('merge_method', 'merge')
         merge_title = body_json.get('commit_title') or f'Merge pull #{number} ({merge_method})'
         # squash: apply the head tree's changed files onto the base
         files = {}
         for path, _status, _old, new_blob in changes:
             files[path] = repo.store.get(new_blob)[1] if new_blob else None
-        conflict = getattr(repo, '_conflict_probe', None)
-        # track base tip at open time for conflict detection
-        opened_base = pull.get('base_tip_at_open', base_oid)
-        if opened_base and opened_base != base_oid:
-            opened_tree = gitobj.parse_commit(repo.store.get(opened_base)[1])['tree'] if repo.store.get(opened_base) else None
-            if opened_tree is not None:
-                for path, _status, _old, _new in changes:
-                    base_files_now = dict(repo.all_files_at(base_tree))
-                    base_files_open = dict(repo.all_files_at(opened_tree))
-                    if path in base_files_now and path in base_files_open and base_files_now[path] != base_files_open[path]:
-                        raise HttpError(405, 'merge conflict')
+        # conflict detection: a path this pull touches was changed on base after the pull opened
+        opened_base = pull.get('base_tip_at_open')
+        if opened_base and opened_base != base_oid and repo.store.get(opened_base):
+            opened_tree = gitobj.parse_commit(repo.store.get(opened_base)[1])['tree']
+            base_files_now = dict(repo.all_files_at(base_tree))
+            base_files_open = dict(repo.all_files_at(opened_tree))
+            for path in files:
+                if path in base_files_now and path in base_files_open and base_files_now[path] != base_files_open[path]:
+                    raise HttpError(405, 'merge conflict')
         tip = repo.apply_commit_to_refs({
             'branch': pull['base'],
             'files': files,
@@ -1047,15 +1040,28 @@ class GraphqlHandler:
 
     def exec_query(self, selection, variables, data, errors):
         fields = self.top_level_fields(selection)
+        pending_alias = None
         for fname, inner in fields:
+            # a bare 'Alias:' label precedes the field it names
+            if fname.endswith(':') and '(' not in fname and '{' not in fname:
+                pending_alias = fname[:-1].strip()
+                continue
+            if pending_alias and not fname.startswith(pending_alias + ':'):
+                fname = f'{pending_alias}: {fname}' if '(' not in fname else fname
+                # keep alias association only when the field carries no alias of its own
+                if ':' not in fname.split('(')[0]:
+                    fname = f'{pending_alias}: {fname}'
+            pending_alias = None
             base = self.field_name(fname)
             if base == 'viewer':
                 data[self.field_name(fname)] = self.subset({'login': VIEWER_LOGIN}, inner, errors)
             elif base == '__type':
-                pass  # handled below via named alias scan
+                name = self.type_name_argument(fname) or variables.get('name')
+                data[self.field_name(fname) or '__type'] = self.introspect_type(name, inner)
+                # handled below via named alias scan too
             elif base == 'node':
                 node_id = self.arg_value(fname, 'id', variables) or variables.get('id')
-                data['node'] = self.node_by_id(node_id, inner)
+                data['node'] = self.node_by_id(node_id, inner, variables)
             elif base.startswith('repository'):
                 data[self.field_name(fname) or 'repository'] = self.repository_field(fname, inner, variables)
             elif base.startswith('rateLimit'):
@@ -1067,7 +1073,7 @@ class GraphqlHandler:
                 # named __type aliases: `Issue: __type(name: "Issue") {...}`
                 alias, _, target = fname.partition(':')
                 target = target.strip()
-                if target == '__type':
+                if target == '__type' or target.startswith('__type(') or target.startswith('__type '):
                     name = self.type_name_argument(op_text=fname) or variables.get('name')
                     data[alias or '__type'] = self.introspect_type(name, inner)
                 else:
@@ -1224,7 +1230,7 @@ class GraphqlHandler:
                 result['kind'] = 'ENUM' if enum_values else 'OBJECT'
         return result
 
-    def node_by_id(self, node_id, inner):
+    def node_by_id(self, node_id, inner, variables=None):
         # global ids are opaque: `repo:<id>` / `issue:<repo>:<n>` / `pull:...`
         info = decode_global_id(node_id)
         if info is None:
@@ -1234,7 +1240,7 @@ class GraphqlHandler:
             repo = self.forge.store.get_repo(info[1], info[2])
             if repo is None:
                 return None
-            return self.repository_node(repo, inner)
+            return self.repository_node(repo, inner, variables)
         return None
 
     def arg_value(self, fname_with_args, arg, variables):
@@ -1253,7 +1259,7 @@ class GraphqlHandler:
         repo = self.forge.store.get_repo(owner, name)
         if repo is None:
             return None
-        return self.repository_node(repo, inner)
+        return self.repository_node(repo, inner, variables)
 
     def arg_str(self, fname_with_args, arg):
         import re
@@ -1294,7 +1300,7 @@ class GraphqlHandler:
                 out[key] = None
         return out
 
-    def repository_node(self, repo, inner):
+    def repository_node(self, repo, inner, variables=None):
         """Serve the requested sub-fields of a repository."""
         if not inner:
             return {'id': global_repo_id(repo)}
@@ -1330,19 +1336,40 @@ class GraphqlHandler:
                 match = re.search(r'number:\s*(\d+|(\$[A-Za-z_]+))', fname)
                 if match:
                     token = match.group(1)
-                    number = int(token[1:]) if token.startswith('$') else int(token)
+                    if token.startswith('$'):
+                        raw = (variables or {}).get(token[1:])
+                        try:
+                            number = int(raw) if raw is not None else None
+                        except (TypeError, ValueError):
+                            number = None
+                    else:
+                        number = int(token)
                 if number is None:
-                    number = variables_number(finner)
+                    number = self.arg_value(fname, 'number', variables)
+                    if number is not None:
+                        try:
+                            number = int(number)
+                        except (TypeError, ValueError):
+                            number = None
                 issue = repo.issues.get(number or -1)
                 out[alias] = self.issue_node(repo, issue, finner) if issue else None
             elif key == 'issues':
-                out[alias] = self.issues_connection(repo, fname, finner)
+                out[alias] = self.issues_connection(repo, fname, finner, variables)
             elif key == 'pullRequest':
                 import re
                 match = re.search(r'number:\s*(\d+|(\$[A-Za-z_]+))', fname)
                 if match:
                     token = match.group(1)
-                    number = int(token[1:]) if token.startswith('$') else int(token)
+                    if token.startswith('$'):
+                        raw = (variables or {}).get(token[1:])
+                        try:
+                            number = int(raw) if raw is not None else None
+                        except (TypeError, ValueError):
+                            number = None
+                    else:
+                        number = int(token)
+                else:
+                    number = None
                 pull = repo.pulls.get(number or -1)
                 out[alias] = self.pull_node(repo, pull, finner) if pull else None
             elif key == 'pullRequests':
@@ -1506,7 +1533,7 @@ class GraphqlHandler:
             nodes.append(node)
         return {'nodes': nodes, 'totalCount': len(comments)}
 
-    def issues_connection(self, repo, fname_with_args, inner):
+    def issues_connection(self, repo, fname_with_args, inner, variables=None):
         import re
         nodes = []
         issues = sorted(repo.issues.values(), key=lambda i: i['number'])
@@ -1523,6 +1550,13 @@ class GraphqlHandler:
         # cursor pagination: after
         after = self.cursor_arg(fname_with_args)
         first = self.first_arg(fname_with_args)
+        if isinstance(first, str) and variables is not None:
+            first = variables.get(first)
+        if after is None and variables is not None:
+            import re as _re
+            m = _re.search(r'after:\s*\$([A-Za-z_][A-Za-z0-9_]*)', fname_with_args)
+            if m:
+                after = variables.get(m.group(1))
         if after:
             try:
                 last_number = int(after.split(':')[-1])

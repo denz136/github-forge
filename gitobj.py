@@ -121,10 +121,13 @@ class PackReader:
         out = bytearray()
         chunk = 65536
         start = pos
-        while not decomp.eof and pos < len(self.data):
-            out += decomp.decompress(self.data[pos:pos + chunk])
-            pos += chunk
-        consumed = len(self.data) - start - len(decomp.unused_data)
+        consumed = 0
+        while not decomp.eof and start + consumed < len(self.data):
+            piece = self.data[start + consumed:start + consumed + chunk]
+            out += decomp.decompress(piece)
+            consumed += len(piece)
+            if decomp.eof:
+                consumed -= len(decomp.unused_data)
         return bytes(out), start + consumed
 
     def _parse(self):

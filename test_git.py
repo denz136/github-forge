@@ -89,9 +89,11 @@ def main():
         assert result.returncode != 0, 'non-ff push should fail'
         ok.append('non-fast-forward rejected')
 
-        # force push accepted
-        run(['git', 'push', '--force', 'origin', 'main'], clone)
-        ok.append('forced push accepted')
+        # the forge refuses every non-fast-forward update, force or not (RULES.txt)
+        result = subprocess.run(['git', 'push', '--force', 'origin', 'main'], cwd=clone, env=GIT_ENV,
+                                capture_output=True, text=True)
+        assert result.returncode != 0, 'force push should also be refused (fast-forward only)'
+        ok.append('forced push refused (fast-forward only forge)')
 
         # branch creation via push
         run(['git', 'push', 'origin', 'main:feature-x'], clone)
